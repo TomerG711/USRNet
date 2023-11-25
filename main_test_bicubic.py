@@ -4,13 +4,17 @@ import cv2
 import numpy as np
 from collections import OrderedDict
 from scipy.io import loadmat
-#import hdf5storage
+# import hdf5storage
 import torch
 
 from utils import utils_logger
 from utils import utils_image as util
 from utils import utils_deblur
 from utils import utils_sisr as sr
+import lpips
+
+lpips_loss_fn = lpips.LPIPS(net='alex')  # You can choose a different network architecture if needed
+lpips_loss_fn.cuda()
 
 '''
 Spyder (Python 3.7)
@@ -58,49 +62,49 @@ testing code of USRNet for the Table 1 in the paper
 """
 
 
-
 def main():
-
     # ----------------------------------------
     # Preparation
     # ----------------------------------------
-    model_name = 'usrnet'      # 'usrgan' | 'usrnet' | 'usrgan_tiny' | 'usrnet_tiny'
-    testset_name = 'set5'     # test set,  'set5' | 'srbsd68'
-    need_degradation = True    # default: True
-    sf = 4                     # scale factor, only from {2, 3, 4}
-    show_img = False           # default: False
-    save_L = True              # save LR image
-    save_E = True              # save estimated image
+    model_name = 'usrnet'  # 'usrgan' | 'usrnet' | 'usrgan_tiny' | 'usrnet_tiny'
+    testset_name = 'celeba'  # test set,  'set5' | 'srbsd68'
+    need_degradation = False  # default: True
+    sf = 4  # scale factor, only from {2, 3, 4}
+    show_img = False  # default: False
+    save_L = True  # save LR image
+    save_E = True  # save estimated image
 
     # load approximated bicubic kernels
-    #kernels = hdf5storage.loadmat(os.path.join('kernels', 'kernels_bicubicx234.mat'))['kernels']
+    # kernels = hdf5storage.loadmat(os.path.join('kernels', 'kernels_bicubicx234.mat'))['kernels']
     kernels = loadmat(os.path.join('kernels', 'kernels_bicubicx234.mat'))['kernels']
-    kernel = kernels[0, sf-2].astype(np.float64)
+    kernel = kernels[0, sf - 2].astype(np.float64)
     kernel = util.single2tensor4(kernel[..., np.newaxis])
 
-    task_current = 'sr'       # fixed, 'sr' for super-resolution
-    n_channels = 3            # fixed, 3 for color image
-    model_pool = 'model_zoo'  # fixed
-    testsets = 'testsets'     # fixed
-    results = 'results'       # fixed
-    noise_level_img = 0       # fixed: 0, noise level for LR image
+    task_current = 'sr'  # fixed, 'sr' for super-resolution
+    n_channels = 3  # fixed, 3 for color image
+    model_pool = '/opt/usrnet/model_zoo'  # fixed
+    testsets = 'testsets'  # fixed
+    results = '/opt/usrnet/images/restored'  # fixed
+    noise_level_img = 12.75  # fixed: 0, noise level for LR image
     noise_level_model = noise_level_img  # fixed, noise level of model, default 0
     result_name = testset_name + '_' + model_name + '_bicubic'
-    border = sf if task_current == 'sr' else 0     # shave boader to calculate PSNR and SSIM
-    model_path = os.path.join(model_pool, model_name+'.pth')
+    border = sf if task_current == 'sr' else 0  # shave boader to calculate PSNR and SSIM
+    model_path = os.path.join(model_pool, model_name + '.pth')
 
     # ----------------------------------------
     # L_path, E_path, H_path
     # ----------------------------------------
-    L_path = os.path.join(testsets, testset_name) # L_path, fixed, for Low-quality images
-    H_path = L_path                               # H_path, 'None' | L_path, for High-quality images
-    E_path = os.path.join(results, result_name)   # E_path, fixed, for Estimated images
+    # L_path = os.path.join(testsets, testset_name) # L_path, fixed, for Low-quality images
+    L_path = '/opt/usrnet/images/degraded'
+    # H_path = L_path                               # H_path, 'None' | L_path, for High-quality images
+    H_path = '/opt/usrnet/images/originals'
+    E_path = os.path.join(results, result_name)  # E_path, fixed, for Estimated images
     util.mkdir(E_path)
 
     if H_path == L_path:
         need_degradation = True
     logger_name = result_name
-    utils_logger.logger_info(logger_name, log_path=os.path.join(E_path, logger_name+'.log'))
+    utils_logger.logger_info(logger_name, log_path=os.path.join(E_path, logger_name + '.log'))
     logger = logging.getLogger(logger_name)
 
     need_H = True if H_path is not None else False
@@ -109,8 +113,8 @@ def main():
     # ----------------------------------------
     # load model
     # ----------------------------------------
-    from models.network_usrnet import USRNet as net   # for pytorch version <= 1.7.1
-    # from models.network_usrnet_v1 import USRNet as net  # for pytorch version >=1.8.1
+    # from models.network_usrnet import USRNet as net   # for pytorch version <= 1.7.1
+    from models.network_usrnet_v1 import USRNet as net  # for pytorch version >=1.8.1
 
     if 'tiny' in model_name:
         model = net(n_iter=6, h_nc=32, in_nc=4, out_nc=3, nc=[16, 32, 64, 64],
@@ -134,6 +138,7 @@ def main():
     test_results['ssim'] = []
     test_results['psnr_y'] = []
     test_results['ssim_y'] = []
+    test_results['lpips'] = []
 
     logger.info('model_name:{}, image sigma:{}'.format(model_name, noise_level_img))
     logger.info(L_path)
@@ -146,14 +151,14 @@ def main():
         # (1) img_L
         # ------------------------------------
         img_name, ext = os.path.splitext(os.path.basename(img))
-        logger.info('{:->4d}--> {:>10s}'.format(idx+1, img_name+ext))
+        logger.info('{:->4d}--> {:>10s}'.format(idx + 1, img_name + ext))
         img_L = util.imread_uint(img, n_channels=n_channels)
         img_L = util.uint2single(img_L)
 
         # degradation process, bicubic downsampling
         if need_degradation:
             img_L = util.modcrop(img_L, sf)
-            img_L = util.imresize_np(img_L, 1/sf)
+            img_L = util.imresize_np(img_L, 1 / sf)
 
             # img_L = util.uint2single(util.single2uint(img_L))
             # np.random.seed(seed=0)  # for reproducibility
@@ -162,15 +167,16 @@ def main():
         w, h = img_L.shape[:2]
 
         if save_L:
-            util.imsave(util.single2uint(img_L), os.path.join(E_path, img_name+'_LR_x'+str(sf)+'.png'))
+            util.imsave(util.single2uint(img_L), os.path.join(E_path, img_name + '_LR_x' + str(sf) + '.png'))
 
-        img = cv2.resize(img_L, (sf*h, sf*w), interpolation=cv2.INTER_NEAREST)
-        img = utils_deblur.wrap_boundary_liu(img, [int(np.ceil(sf*w/8+2)*8), int(np.ceil(sf*h/8+2)*8)])
+        img = cv2.resize(img_L, (sf * h, sf * w), interpolation=cv2.INTER_NEAREST)
+        img = utils_deblur.wrap_boundary_liu(img, [int(np.ceil(sf * w / 8 + 2) * 8), int(np.ceil(sf * h / 8 + 2) * 8)])
         img_wrap = sr.downsample_np(img, sf, center=False)
         img_wrap[:w, :h, :] = img_L
         img_L = img_wrap
 
-        util.imshow(util.single2uint(img_L), title='LR image with noise level {}'.format(noise_level_img)) if show_img else None
+        util.imshow(util.single2uint(img_L),
+                    title='LR image with noise level {}'.format(noise_level_img)) if show_img else None
 
         img_L = util.single2tensor4(img_L)
         img_L = img_L.to(device)
@@ -184,7 +190,7 @@ def main():
         img_E = model(img_L, kernel, sf, sigma)
 
         img_E = util.tensor2uint(img_E)
-        img_E = img_E[:sf*w, :sf*h, :]
+        img_E = img_E[:sf * w, :sf * h, :]
 
         if need_H:
 
@@ -200,9 +206,17 @@ def main():
             # --------------------------------
             psnr = util.calculate_psnr(img_E, img_H, border=border)
             ssim = util.calculate_ssim(img_E, img_H, border=border)
+            # print(img_E.shape)
+            # print(img_H.shape)
+            # print(torch.from_numpy(img_E).shape, torch.from_numpy(img_H).shape)
+            # print(torch.from_numpy(img_E).shape == torch.from_numpy(img_H).shape)
+            lpips = lpips_loss_fn(torch.from_numpy(img_E).permute(2, 0, 1).cuda(),
+                                  torch.from_numpy(img_H).permute(2, 0, 1).cuda())
+            test_results['lpips'].append(lpips.item())
             test_results['psnr'].append(psnr)
             test_results['ssim'].append(ssim)
-            logger.info('{:s} - PSNR: {:.2f} dB; SSIM: {:.4f}.'.format(img_name+ext, psnr, ssim))
+            logger.info(
+                '{:s} - PSNR: {:.2f} dB; LPIPS: {:.4f}; SSIM: {:.4f}.'.format(img_name + ext, psnr, lpips.item(), ssim))
             util.imshow(np.concatenate([img_E, img_H], axis=1), title='Recovered / Ground-truth') if show_img else None
 
             if np.ndim(img_H) == 3:  # RGB image
@@ -217,18 +231,24 @@ def main():
         # save results
         # ------------------------------------
         if save_E:
-            util.imsave(img_E, os.path.join(E_path, img_name+'_x'+str(sf)+'_'+model_name+'.png'))
+            util.imsave(img_E, os.path.join(E_path, img_name + '_x' + str(sf) + '_' + model_name + '.png'))
 
     if need_H:
         ave_psnr = sum(test_results['psnr']) / len(test_results['psnr'])
         ave_ssim = sum(test_results['ssim']) / len(test_results['ssim'])
-        logger.info('Average PSNR/SSIM(RGB) - {} - x{} --PSNR: {:.2f} dB; SSIM: {:.4f}'.format(result_name, sf, ave_psnr, ave_ssim))
+        ave_lpips = sum(test_results['lpips']) / len(test_results['lpips'])
+        logger.info(
+            'Average PSNR/SSIM(RGB) - {} - x{} --PSNR: {:.2f} dB; LPIPS: {:.4f}; SSIM: {:.4f}'.format(result_name, sf,
+                                                                                                      ave_psnr,
+                                                                                                      ave_lpips,
+                                                                                                      ave_ssim))
         if np.ndim(img_H) == 3:
             ave_psnr_y = sum(test_results['psnr_y']) / len(test_results['psnr_y'])
             ave_ssim_y = sum(test_results['ssim_y']) / len(test_results['ssim_y'])
-            logger.info('Average PSNR/SSIM( Y ) - {} - x{} - PSNR: {:.2f} dB; SSIM: {:.4f}'.format(result_name, sf, ave_psnr_y, ave_ssim_y))
+            logger.info(
+                'Average PSNR/SSIM( Y ) - {} - x{} - PSNR: {:.2f} dB; SSIM: {:.4f}'.format(result_name, sf, ave_psnr_y,
+                                                                                           ave_ssim_y))
 
 
 if __name__ == '__main__':
-
     main()
